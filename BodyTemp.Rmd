@@ -1,0 +1,184 @@
+---
+title: "BodyTemp#1"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lme4)
+library(grid)
+library(gridExtra)
+library(dplyr)
+knitr::opts_chunk$set(echo = TRUE)
+library(devtools)
+devtools::install_github("simonecollier/lizardHMM")
+library(lizardHMM)
+library(tinytex)
+library(forecast)
+```
+
+## Retrieve and clean Data
+
+```{r, include = TRUE}
+library(readxl)
+Pm_33_20Jul2021_1_ <- read_excel("Pm_33_20Jul2021 (1).xlsx")
+trial1 <- Pm_33_20Jul2021_1_
+trial1 <- subset (trial1, select = -c(frame, ...5))
+```
+
+```{r}
+#Covariate: Body Temperature Data 
+body_temperature <- read_excel("Gradient Experiment Summer 2021_ Extracted Thermal Data.xlsx")
+plot(body_temperature$TIME, body_temperature$AVG_TB, xlab="Time (s)", ylab="Body Temperature", 
+     main = "PM 33 Body Temperature",pch=16)
+lines(body_temperature$TIME, body_temperature$AVG_TB, type = "l")
+
+# Interpolate linearly so that we have temperature for every second
+na_ind <- which(is.na(body_temperature))
+# 144 and 145 are the indices with missing data (lizard out of frame)
+# split up interpolation into sections...
+temp_data <- data.frame('x' = numeric(), 'y' = numeric())
+x = body_temperature$TIME[1:143]
+y = body_temperature$AVG_TB[1:143]
+for (i in 1:(length(x)-1)) {
+  temp = as.data.frame(approx(x = c(x[i], x[i+1]), y = c(y[i], y[i+1]), n = 31))
+  temp_data  <- rbind(temp_data, temp)
+}
+# Interpolate over missing data points
+temp_data  <- rbind(temp_data, approx(x = c(body_temperature$TIME[143], 
+                                            body_temperature$TIME[146]), 
+                                      y = c(body_temperature$AVG_TB[143], 
+                                            body_temperature$AVG_TB[146]), n = 30*2+31))
+# Interpolate rest of data
+x = body_temperature$TIME[146:nrow(body_temperature)]
+y = body_temperature$AVG_TB[146:nrow(body_temperature)]
+for (i in 1:(length(x)-1)) {
+  temp = as.data.frame(approx(x = c(x[i], x[i+1]), y = c(y[i], y[i+1]), n = 31))
+  temp_data  <- rbind(temp_data, temp)
+}
+# Remove duplicate rows
+temp_data <- temp_data[!duplicated(temp_data), ]
+# Rename columns
+temp_data <- data.frame('time' = temp_data$x, 'body_temp' = temp_data$y)
+cov_mu <- mean(temp_data$body_temp)
+temp_data$cov= temp_data$body_temp - cov_mu
+```
+
+
+Reduce the values to one frame per second
+```{r}
+skip_xpos <- as.numeric(trial1$pos_x[seq(28, length(trial1$pos_x), 29.97)])
+skip_ypos <- as.numeric(trial1$pos_y[seq(28, length(trial1$pos_y), 29.97)])
+steps <- euclidean_distance(skip_xpos, skip_ypos)
+stepdata <- data.frame(step_length = steps,
+                       time = seq(from = 1, by = 1, #29.97fps/29.97 -> 1fps
+                                  length.out = length(steps)))
+num_time <- nrow(stepdata)
+
+#filter out data in sqrt_steps that is +/- inf
+stepdata$sqrt_steps <- sqrt(stepdata$step_length)
+inf_ind <- which(is.infinite(stepdata$sqrt_steps))
+for (i in inf_ind) {
+  stepdata$sqrt_steps[i] <- NA
+}
+
+#filter out data resulting from the tracking dot switching back and forth: indices of stepdata that have a step_length greater than 0.4
+ind <- which(stepdata$log_steps[(1):(6900)] >2) 
+for(i in ind) {
+  stepdata$log_steps[i] <- NA
+}
+```
+
+Plot 2 hour timeseries
+
+```{r}
+ggplot(data = stepdata, aes(x=time, y = sqrt_steps)) + 
+  geom_point() +
+  theme_bw() +
+  theme(panel.grid.major = ggplot2::element_blank(),
+        panel.grid.minor = ggplot2::element_blank(),
+        plot.title = ggplot2:: element_blank()) +
+  labs(x = 'Time (s)', y = 'Sqrt(Step Length)')
+```
+
+Histogram of square root step lengths:
+
+```{r}
+ggplot(data = stepdata, aes(x = sqrt_steps)) +
+  geom_histogram(binwidth = 0.01,
+                 colour = "cornsilk4",
+                 fill = "white") +
+  theme_bw() + 
+  theme(panel.grid.major = ggplot2::element_blank(),
+        panel.grid.minor = ggplot2::element_blank(),
+        plot.title = ggplot2::element_blank()) +
+  labs(x = 'sqrt(Step Length) per 0.2 s', y = '') + xlim(c(0,2)) + ylim(c(0,150))
+```
+
+
+Define Parameters for Gamma Distribution
+
+```{r}
+stepdata = stepdata[1:7171,]
+num_variables = 1
+num_subjects = 1
+num_covariates = 1
+x             <- array(dim = c(7171, num_variables, num_subjects))
+x[, 1, 1]     <- stepdata$sqrt_steps
+# no covariates so the design matrix is just a column of ones
+design           <- list(matrix(0, nrow = 7171, ncol = 2))
+#the first column values are equal to 0 
+design[[1]][, 1] <- 1
+design[[1]][, 2] <- temp_data$cov
+```
+
+Fit sqrt of step lengths with a 2-state gamma HMM:
+
+```{r setup, include=FALSE}
+num_states <- 3
+alpha0 <- list(matrix(c(3.66166, 8.460217, 3.160654), ncol = num_states, nrow = 1, byrow = TRUE))
+theta0 <- list(matrix(c(2.1058, 0.04681596, 0.28232), ncol = num_states, nrow = 1, byrow = TRUE))
+beta0 <- matrix(c(-1.8737115,
+                  0,
+                  -0.3048243,
+                  0,
+                  -6.6988466,
+                  0,
+                  -3.9809022,
+                  0,
+                  -4.5315041,
+                  0,
+                  -3.0586499,
+                  0), ncol = 2, nrow = 6, byrow = TRUE)
+zweight0 <- list(c(0.4))
+delta0 <- list(c(1/3, 1/3, 1/3))
+
+sq0step_cov <- gam0_fit_hmm(x, design, num_states = 3, num_variables = 1, num_subjects =1, num_covariates = 1, alpha0, theta0, zweight0, beta0 = beta0, delta0, iterlim = 200, hessian = TRUE)
+sq0step_cov
+```
+
+```{r}
+CI <- gam0_ci(sq0step_cov, state_dep_dist_pooled = FALSE, n = 100, level = 0.975)
+CI
+```
+```{r}
+viterbi <- gam0_viterbi(x, sq0step_cov)
+timeseries_plot(x, viterbi, num_subjects, num_variables, start = 800, end = 2100)
+```
+
+
+```{r}
+gam0_hist_ci(x, viterbi, num_states =3, num_subjects, num_variables, sq0step_cov, 
+             state_dep_dist_pooled = FALSE, width = 0.01, n = 100, level = 0.975,
+             x_step = 0.01, xaxis = list(list(c(0,10))))
+```
+Pseudo Residuals
+
+```{r}
+sqstep0_psr <- gam0_forecast_psr(x, sq0step_cov)
+psr_plot(sq0step_cov, num_subjects)
+psr_hist(sq0step_cov, num_subjects)
+```
+
+
