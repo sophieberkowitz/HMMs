@@ -1,0 +1,347 @@
+---
+title: "GammaSqRoot"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lme4)
+library(grid)
+library(gridExtra)
+library(dplyr)
+knitr::opts_chunk$set(echo = TRUE)
+library(devtools)
+devtools::install_github("simonecollier/lizardHMM")
+library(lizardHMM)
+library(tinytex)
+library(forecast)
+```
+
+## Retrieve and clean Data
+
+```{r, include = TRUE}
+library(readxl)
+Pm_33_20Jul2021_1_ <- read_excel("Pm_33_20Jul2021 (1).xlsx")
+trial1 <- Pm_33_20Jul2021_1_
+trial1 <- subset (trial1, select = -c(frame, ...5))
+```
+
+Reduce the values to one frame per second
+```{r}
+skip_xpos <- as.numeric(trial1$pos_x[seq(28, length(trial1$pos_x), 29.97)])
+skip_ypos <- as.numeric(trial1$pos_y[seq(28, length(trial1$pos_y), 29.97)])
+steps <- euclidean_distance(skip_xpos, skip_ypos)
+stepdata <- data.frame(step_length = steps,
+                       time = seq(from = 1, by = 1, #29.97fps/29.97 -> 1fps
+                                  length.out = length(steps)))
+num_time <- nrow(stepdata)
+
+#filter out data in sqrt_steps that is +/- inf
+stepdata$sqrt_steps <- sqrt(stepdata$step_length)
+inf_ind <- which(is.infinite(stepdata$sqrt_steps))
+for (i in inf_ind) {
+  stepdata$sqrt_steps[i] <- NA
+}
+
+#filter out data resulting from the tracking dot switching back and forth: indices of stepdata that have a step_length greater than 0.4
+ind <- which(stepdata$log_steps[(1):(6900)] >2) 
+for(i in ind) {
+  stepdata$log_steps[i] <- NA
+}
+```
+
+Plot 2 hour timeseries
+
+```{r}
+ggplot(data = stepdata, aes(x=time, y = sqrt_steps)) + 
+  geom_point() +
+  theme_bw() +
+  theme(panel.grid.major = ggplot2::element_blank(),
+        panel.grid.minor = ggplot2::element_blank(),
+        plot.title = ggplot2:: element_blank()) +
+  labs(x = 'Time (s)', y = 'Sqrt(Step Length)')
+```
+Histogram of logged step lengths:
+
+```{r}
+ggplot(data = stepdata, aes(x = sqrt_steps)) +
+  geom_histogram(binwidth = 0.01,
+                 colour = "cornsilk4",
+                 fill = "white") +
+  theme_bw() + 
+  theme(panel.grid.major = ggplot2::element_blank(),
+        panel.grid.minor = ggplot2::element_blank(),
+        plot.title = ggplot2::element_blank()) +
+  labs(x = 'sqrt(Step Length) per 0.2 s', y = '') + xlim(c(0,2)) + ylim(c(0,150))
+```
+
+Define Parameters for Gamma Distribution
+
+```{r}
+num_variables = 1
+num_subjects = 1
+num_covariates = 0
+x             <- array(dim = c(num_time, num_variables, num_subjects))
+x[, 1, 1]     <- stepdata$sqrt_steps
+# no covariates so the design matrix is just a column of ones
+design           <- list(matrix(0, nrow = num_time, ncol = 1))
+design[[1]][, 1] <- 1
+```
+
+Fit sqrt of step lengths with a 2-state gamma HMM:
+
+```{r setup, include=FALSE}
+zweight0 <- list(c(0.4))
+beta0 <- matrix(c(-1,
+                  -1), ncol = 1, nrow = 2, byrow = TRUE)
+delta0 <- list(c(1/2, 1/2))
+#Package for parallel computations
+library(parallel)
+
+#Create cluster of size ncores
+ncores <- detectCores() - 1
+cl <- makeCluster(getOption("cl.cores", ncores))
+#Export objects needed in parallelised function to cluster
+clusterExport(cl, list("x", "gam0_fit_hmm", "beta0", "delta0", "design", "zweight0"))
+
+num_states <- 2
+#set.seed(12902)
+niter <- 25
+allM <- list()
+
+#Create list of starting values
+allPar0 <- lapply(as.list(1:niter), function(z) {
+  #Step Length Mean
+  alpha0 <- list(matrix(runif(2, min = c(.25, .5), max=c(.5, 1.5)), 
+                     ncol = 2, nrow = 1, byrow = TRUE))
+  #Step length SD
+  theta0 <- list(matrix(runif(2, min=c(.5, 2), max=c(2, 4)), 
+                        ncol = 2, nrow = 1, byrow = TRUE))
+  
+  
+  return(list(alpha = alpha0, theta = theta0))
+})
+
+#mu0 = allPar0[]
+#sigma0 = allPar0[1][1]
+
+allm_parallel <- parLapply(cl = cl, X = allPar0, fun = function(par0){
+  
+  m <- gam0_fit_hmm(x, design, num_states = 2, num_variables = 1, num_subjects =1,num_covariates = 0, alpha0 = par0$alpha, theta =par0$theta, zweight0, beta0 = beta0, delta0, iterlim = 200, hessian = TRUE)
+  
+  return(m)
+})
+
+View(allm_parallel)
+mllks <- numeric()
+for (i in 1:niter) {
+  mllks <- c(mllks, allm_parallel[[i]]$max_loglikelihood)
+}
+
+
+#Extract likelihoods of fitted models
+#mllks <- unlist(lapply(allM, function(m) m$hmm$max_loglikelihood))
+
+whichbest <- which.min(mllks)
+whichbest
+sqstep_fit2 <- allm_parallel[[16]]
+sqstep_fit2 
+```
+
+```{r, include = TRUE}
+CI <- gam0_ci(sqstep_fit2, state_dep_dist_pooled = FALSE, n = 100, level = 0.975)
+CI
+```
+
+```{r}
+viterbi <- gam0_viterbi(x, sqstep_fit2)
+timeseries_plot(x, viterbi, num_subjects, num_variables, end = 900)
+```
+
+
+Histogram of sqrt(step lengths) with state dependent Gamma distributions & CIs
+```{r}
+gam0_hist_ci(x, viterbi, num_states, num_subjects, num_variables, sqstep_fit2, 
+             state_dep_dist_pooled = FALSE, width = 0.01, n = 100, level = 0.975,
+             x_step = 0.01, xaxis = list(list(c(0,10))))
+#whats a situation where state_dep_dist_pooled  = TRUE
+```
+
+
+Pseudo Residuals
+
+```{r}
+sqstep_psr2 <- gam0_forecast_psr(x, sqstep_fit2)
+psr_plot(sqstep_fit2, num_subjects)
+psr_hist(sqstep_fit2, num_subjects)
+```
+
+```{r}
+psr_qq(sqstep_fit2, 1)
+```
+
+```{r}
+sqstep_psr2 <- gam0_forecast_psr(x, sqstep_fit2)
+psr_acf(sqstep_psr2, 1)
+```
+
+Fit sqrt of step lengths with a 3-state gamma HMM:
+
+```{r setup, include=FALSE}
+zweight0 <- list(c(0.4))
+beta0 <- matrix(c(-1,
+                  -1,
+                  -1,
+                  -1,
+                  -1,
+                  -1), ncol = 1, nrow = 6, byrow = TRUE)
+delta0 <- list(c(1/3, 1/3, 1/3))
+#Package for parallel computations
+library(parallel)
+
+#Create cluster of size ncores
+ncores <- detectCores() - 1
+cl <- makeCluster(getOption("cl.cores", ncores))
+#Export objects needed in parallelised function to cluster
+clusterExport(cl, list("x", "gam0_fit_hmm", "beta0", "delta0", "design", "zweight0"))
+
+num_states <- 3
+#set.seed(12902)
+niter <- 25
+#allM <- list()
+
+#Create list of starting values
+allPar0 <- lapply(as.list(1:niter), function(z) {
+  #Step Length Mean
+  alpha0 <- list(matrix(runif(3, min = c(.5, 1, 2), max=c(2, 3, 4)), 
+                     ncol = 3, nrow = 1, byrow = TRUE))
+  #Step length SD
+  theta0 <- list(matrix(runif(3, min=c(.5, .75, 1), max=c(1, 1.5, 2)), 
+                        ncol = 3, nrow = 1, byrow = TRUE))
+  
+  
+  return(list(alpha = alpha0, theta = theta0))
+})
+
+#mu0 = allPar0[]
+#sigma0 = allPar0[1][1]
+
+allm_parallel <- parLapply(cl = cl, X = allPar0, fun = function(par0){
+  
+  m <- gam0_fit_hmm(x, design, num_states = 3, num_variables = 1, num_subjects =1,num_covariates = 0, alpha0 = par0$alpha, theta =par0$theta, zweight0, beta0 = beta0, delta0, iterlim = 200, hessian = TRUE)
+  
+  return(m)
+})
+
+mllks <- numeric()
+for (i in 1:niter) {
+  mllks <- c(mllks, allm_parallel[[i]]$max_loglikelihood)
+}
+
+
+#Extract likelihoods of fitted models
+#mllks <- unlist(lapply(allM, function(m) m$hmm$max_loglikelihood))
+
+whichbest <- which.min(mllks)
+whichbest
+sqstep_fit3 <- allm_parallel[[19]]
+sqstep_fit3
+```
+
+```{r, include = TRUE}
+CI <- gam0_ci(sqstep_fit3, state_dep_dist_pooled = FALSE, n = 100, level = 0.975)
+CI
+```
+```{r}
+viterbi <- gam0_viterbi(x, sqstep_fit3)
+timeseries_plot(x, viterbi, num_subjects, num_variables, end = 2100)
+```
+
+Histogram of sqrt(step lengths) with state dependent Gamma distributions & CIs
+```{r}
+gam0_hist_ci(x, viterbi, num_states =3, num_subjects, num_variables, sqstep_fit3, 
+             state_dep_dist_pooled = FALSE, width = 0.01, n = 100, level = 0.975,
+             x_step = 0.01, xaxis = list(list(c(0,10))))
+#whats a situation where state_dep_dist_pooled  = TRUE
+```
+
+Fit sqrt of step lengths with a 4-state gamma HMM:
+
+```{r setup, include=FALSE}
+zweight0 <- list(c(0.4))
+beta0 <- matrix(c(-1,
+                  -1,
+                  -1,
+                  -1,
+                  -1,
+                  -1,
+                  -1,
+                  -1,
+                  -1,
+                  -1,
+                  -1,
+                  -1), ncol = 1, nrow = 12, byrow = TRUE)
+delta0 <- list(c(1/4, 1/4, 1/4, 1/4))
+#Package for parallel computations
+library(parallel)
+
+#Create cluster of size ncores
+ncores <- detectCores() - 1
+cl <- makeCluster(getOption("cl.cores", ncores))
+#Export objects needed in parallelised function to cluster
+clusterExport(cl, list("x", "gam0_fit_hmm", "beta0", "delta0", "design", "zweight0"))
+
+num_states <- 4
+#set.seed(12902)
+niter <- 25
+#allM <- list()
+
+#Create list of starting values
+allPar0 <- lapply(as.list(1:niter), function(z) {
+  #Step Length Mean
+  alpha0 <- list(matrix(runif(4, min = c(.5, 1, 2, 3), max=c(3, 4, 5, 6)), 
+                     ncol = 4, nrow = 1, byrow = TRUE))
+  #Step length SD
+  theta0 <- list(matrix(runif(4, min=c(.25, .5, .75, 1), max=c(1, 1.5, 1.75, 2)), 
+                        ncol = 4, nrow = 1, byrow = TRUE))
+  
+  
+  return(list(alpha = alpha0, theta = theta0))
+})
+
+#mu0 = allPar0[]
+#sigma0 = allPar0[1][1]
+
+allm_parallel <- parLapply(cl = cl, X = allPar0, fun = function(par0){
+  
+  m <- gam0_fit_hmm(x, design, num_states = 4, num_variables = 1, num_subjects =1,num_covariates = 0, alpha0 = par0$alpha, theta =par0$theta, zweight0, beta0 = beta0, delta0, iterlim = 200, hessian = TRUE)
+  
+  return(m)
+})
+
+mllks <- numeric()
+for (i in 1:niter) {
+  mllks <- c(mllks, allm_parallel[[i]]$max_loglikelihood)
+}
+
+
+#Extract likelihoods of fitted models
+#mllks <- unlist(lapply(allM, function(m) m$hmm$max_loglikelihood))
+
+whichbest <- which.min(mllks)
+whichbest
+sqstep_fit4 <- allm_parallel[[1]]
+sqstep_fit4
+```
+
+```{r, include = TRUE}
+CI <- gam0_ci(sqstep_fit4, state_dep_dist_pooled = FALSE, n = 100, level = 0.975)
+CI
+```
+
+```{r}
+viterbi <- gam0_viterbi(x, sqstep_fit4)
+timeseries_plot(x, viterbi, num_subjects, num_variables, end = 900)
+```
+
